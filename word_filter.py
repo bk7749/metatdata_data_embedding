@@ -1,11 +1,15 @@
 import shelve
 from datetime import datetime
+from collections import Counter
 import re
+import pdb
 import pickle
 import editdistance
 import pandas as pd
 import numpy as np
 import sys
+import os
+import jellyfish as jf
 
 
 
@@ -16,7 +20,6 @@ class WordFilter():
 	naeDict = dict()
 	naeList = None
 	sensorDict = None
-	distDict = None
 
 
 	def __init__ (self, buildingName):
@@ -29,7 +32,6 @@ class WordFilter():
 		self.naeDict['bsb'] = ['519', '568', '567', '566', '564', '565']
 		self.naeDict['ebu3b'] = ["505", "506"]
 		self.naeList = self.naeDict[self.buildingName]
-		self.distDict = dict()
 		
 		srcidSet = set([])
 		for nae in self.naeList:
@@ -45,46 +47,64 @@ class WordFilter():
 					self.rawWordList = self.rawWordList + re.findall("[a-zA-Z]+", sensor['name'])
 					self.rawWordList = self.rawWordList + re.findall("[a-zA-Z]+", sensor['jci_name'])
 					self.rawWordList = self.rawWordList + re.findall("[a-zA-Z]+", sensor['desc'])
+		self.rawWordList = [word.lower() for word in self.rawWordList]
+#		self.rawWordList = Counter(self.rawWordList).keys()
+		self.rawWordList = [word.decode('unicode-escape') for word in Counter(self.rawWordList).keys()]
 		print "initiated for", self.buildingName, datetime.now()
 
-	def calc_editdistance(self):
+	def calc_editdistance(self, distFunc, metricName):
+		distDict = dict()
 		for i, word in enumerate(self.rawWordList):
 			for j in range(i+1,len(self.rawWordList)):
-				wordee = self.rawWordList[j]
-				self.distDict[(word, wordee)] = editdistance.eval(word, wordee)
-		with open('data/'+'editdist_'+self.buildingName+'.pkl', 'wb') as fp:
-			pickle.dump(sefl.distDict, fp)
+				wordee = self.rawWordList[j].lower()
+				word = word.lower()
+				try:
+					distDict[(word, wordee)] = distFunc(word, wordee)
+				except:
+					print word, wordd
+					assert(False)
+
+		wordList = [wordTuple[0] for wordTuple in distDict.keys()]
+		wordeeList = [wordTuple[1] for wordTuple in distDict.keys()]
+		distList = distDict.values()
+		prepDF = np.transpose(np.asarray([wordList, wordeeList, distList]))
+		pd.DataFrame(prepDF).to_csv('result/'+metricName+'_'+self.buildingName+'.csv')
+		with open('data/'+metricName+'_'+self.buildingName+'.pkl', 'wb') as fp:
+			pickle.dump(distDict, fp)
 		print "finished distance calculation", datetime.now()
 
-	def filter_editdistance(self):
-		threshold = 0.65
+	def filter_editdistance(self, distDict, metricName):
+		print "start filtering"
+		threshold = 0.32
 		distList = list()
 		for i, word in enumerate(self.rawWordList):
 			for j in range(i+1, len(self.rawWordList)):
 				wordee = self.rawWordList[j]
 				if len(word)<=2 or len(wordee)<=2:
 					continue
-				if len(word)>=len(wordee):
+				if len(word)>len(wordee):
+					shortWord = wordee
+					longWord = word
+				elif len(word)<len(wordee):
 					shortWord = word
 					longWord = wordee
 				else:
-					shortWord = wordee
-					longWord = word
-				if (shortWord, longWord) in self.distDict.keys():
+					continue
+				if (shortWord, longWord) in distDict.keys():
 					dist = distDict[(shortWord, longWord)]
 				else:
 					dist = distDict[(longWord, shortWord)]
-				realDist = dist - (len(longWord) - len(shortWord))
-				if realDist >= shortWord*threshold:
-				 	print shortWord, longWord
-					self.filteredWordMap[shortWord] = longWord
-					distList.append(realDist)
-		with open('data/'+'filteredwords_'+bulidingName+'.pkl', 'wb') as fp:
-			pickle.dump(filteredWordMap, fp)
+				realDist = dist - (len(longWord) - len(shortWord))/2
+				if realDist <= len(shortWord)*threshold:
+				 	print shortWord, longWord, realDist
+#			self.filteredWordMap[shortWord] = longWord
+					self.filteredWordMap[(shortWord, longWord)] = realDist
+		with open('data/'+'filteredwords_'+metricName+'_'+self.buildingName+'.pkl', 'wb') as fp:
+			pickle.dump(self.filteredWordMap, fp)
 		outputDF = pd.DataFrame()	
-		outputDF['keyword'] = self.filteredWordMap.keys()
-		outputDF['interpretation'] = self.filteredWordMap.values()
-		outputDF['dist'] = realDist
+		outputDF['keyword'] = [wordTuple[0] for wordTuple in self.filteredWordMap.keys()]
+		outputDF['interpretation'] = [wordTuple[1] for wordTuple in self.filteredWordMap.keys()]
+		outputDF['dist'] = self.filteredWordMap.values()
 		writer = pd.ExcelWriter('result/'+'filteredwords_'+self.buildingName+'.xlsx')
 		outputDF.to_excel(writer, 'Sheet1')
 		writer.save()
@@ -92,9 +112,24 @@ class WordFilter():
 					
 
 def main(argv):
-	wf = WordFilter('ebu3b')
-	wf.calc_editdistance()
-	wf.filter_editdistance()
+	buildingName = 'ebu3b'
+	wf = WordFilter(buildingName)
+	metricNameList = ['edit', 'damerau', 'jaro', 'jarowinkler', 'hamming']
+#	metricNameList = ['damerau', 'jaro', 'jarowinkler', 'hamming']
+	metricList = [editdistance.eval, jf.damerau_levenshtein_distance,\
+				 jf.jaro_distance, jf.jaro_winkler, jf.hamming_distance]
+#	metricList = [jf.damerau_levenshtein_distance,\
+	for metric, metricName in zip(metricList, metricNameList):
+		print metricName
+		filename = 'data/'+metricName+'_'+buildingName+'.pkl'
+		if not os.path.isfile(filename):
+			wf.calc_editdistance(metric, metricName)
+	for metricName in metricNameList:
+		filename = 'data/'+metricName+'_'+buildingName+'.pkl'
+		print metricName
+		with open(filename, 'rb') as fp:
+			distDict = pickle.load(fp)
+		wf.filter_editdistance(distDict, metricName)
 
 
 if __name__ == "__main__":
